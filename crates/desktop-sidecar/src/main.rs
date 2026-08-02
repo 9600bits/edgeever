@@ -742,7 +742,7 @@ fn merge_memos(database: &Connection, params: &Value) -> Result<Value, String> {
     let mut markdowns = Vec::new();
     let mut tags = Vec::<String>::new();
     for id in &ids {
-        let row = database.query_row("SELECT m.title, m.notebook_id, c.content_markdown, m.tags_json FROM memos m JOIN memo_contents c ON c.memo_id = m.id WHERE m.id = ?1 AND m.is_deleted = 0", [id], |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?))).map_err(|e| e.to_string())?;
+        let row = database.query_row("SELECT m.title, m.notebook_id, c.content_markdown, m.tags_json, c.content_text, c.content_json FROM memos m JOIN memo_contents c ON c.memo_id = m.id WHERE m.id = ?1 AND m.is_deleted = 0", [id], |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?))).map_err(|e| e.to_string())?;
         if first_notebook_id.is_none() {
             first_notebook_id = Some(row.1);
         }
@@ -751,7 +751,7 @@ fn merge_memos(database: &Connection, params: &Value) -> Result<Value, String> {
                 titles.push(title);
             }
         }
-        markdowns.push(row.2);
+        markdowns.push(resolve_sidecar_merge_markdown(&row.2, &row.4, &row.5)?);
         let memo_tags: Vec<String> = serde_json::from_str(&row.3).unwrap_or_default();
         tags.extend(memo_tags);
     }
@@ -763,8 +763,8 @@ fn merge_memos(database: &Connection, params: &Value) -> Result<Value, String> {
         .get("title")
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
-        .map(str::to_owned)
-        .or_else(|| titles.into_iter().find(|value| !value.starts_with("nb_")))
+        .map(|value| value.trim().to_owned())
+        .or_else(|| resolve_custom_merge_title(titles.iter().map(String::as_str)))
         .unwrap_or_default();
     tags.sort();
     tags.dedup();
@@ -793,6 +793,59 @@ fn merge_memos(database: &Connection, params: &Value) -> Result<Value, String> {
     memo_value(database, &id, true).map(|memo| json!({ "memo": memo }))
 }
 
+fn resolve_custom_merge_title<'a>(titles: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    titles
+        .into_iter()
+        .map(str::trim)
+        .find(|title| !title.is_empty() && *title != "无标题笔记")
+        .map(str::to_owned)
+}
+
+fn resolve_sidecar_merge_markdown(
+    markdown: &str,
+    content_text: &str,
+    content_json: &str,
+) -> Result<String, String> {
+    if !markdown.trim().is_empty() {
+        return Ok(markdown.to_owned());
+    }
+
+    if !content_text.trim().is_empty() {
+        return Ok(content_text.to_owned());
+    }
+
+    let content: Value = serde_json::from_str(content_json).unwrap_or(Value::Null);
+    if sidecar_doc_has_non_text_content(&content) {
+        return Err(
+            "Source note content could not be recovered safely. Merge was cancelled.".to_owned(),
+        );
+    }
+
+    Ok(String::new())
+}
+
+fn sidecar_doc_has_non_text_content(value: &Value) -> bool {
+    let node_type = value.get("type").and_then(Value::as_str).unwrap_or("");
+    if matches!(
+        node_type,
+        "image"
+            | "table"
+            | "codeBlock"
+            | "bulletList"
+            | "orderedList"
+            | "blockquote"
+            | "horizontalRule"
+            | "edgeeverThemeBlock"
+    ) {
+        return true;
+    }
+
+    value
+        .get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|children| children.iter().any(sidecar_doc_has_non_text_content))
+}
+
 fn list_memos(database: &Connection, params: &Value) -> Result<Value, String> {
     let trash = bool_param(params, "trash", false);
     let q = params
@@ -801,12 +854,19 @@ fn list_memos(database: &Connection, params: &Value) -> Result<Value, String> {
         .unwrap_or("")
         .trim()
         .to_owned();
-    let notebook_id = params.get("notebookId").and_then(Value::as_str);
     let notebook_ids = params
         .get("notebookIds")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    // A notebookIds collection represents the complete notebook subtree and
+    // therefore supersedes the singular notebookId. Applying both filters
+    // would reduce the subtree back to the parent notebook alone.
+    let notebook_id = if notebook_ids.is_empty() {
+        params.get("notebookId").and_then(Value::as_str)
+    } else {
+        None
+    };
     let notebook_ids_json = Value::Array(notebook_ids).to_string();
     let filter = match params.get("filter").and_then(Value::as_str) {
         Some("pinned") => " AND m.is_pinned = 1",
@@ -931,6 +991,7 @@ fn update_memo(database: &Connection, params: &Value) -> Result<Value, String> {
     let markdown = params
         .get("contentMarkdown")
         .and_then(Value::as_str)
+        .or_else(|| previous.get("contentMarkdown").and_then(Value::as_str))
         .unwrap_or("")
         .to_owned();
     let text = params
@@ -1549,5 +1610,38 @@ mod tests {
         let first = content_hash("same", &json);
         assert_eq!(first, content_hash("same", &json));
         assert_ne!(first, content_hash("different", &json));
+    }
+
+    #[test]
+    fn merge_title_skips_untitled_sources() {
+        assert_eq!(
+            resolve_custom_merge_title(["无标题笔记", "  手动标题  ", "另一个标题"]),
+            Some("手动标题".to_owned())
+        );
+        assert_eq!(resolve_custom_merge_title(["无标题笔记", "  "]), None);
+    }
+
+    #[test]
+    fn merge_content_falls_back_to_stored_text_when_markdown_is_empty() {
+        assert_eq!(
+            resolve_sidecar_merge_markdown("", "正文仍然存在", r#"{"type":"doc","content":[]}"#)
+                .unwrap(),
+            "正文仍然存在"
+        );
+        assert_eq!(
+            resolve_sidecar_merge_markdown(
+                "**保留格式**",
+                "保留格式",
+                r#"{"type":"doc","content":[]}"#
+            )
+            .unwrap(),
+            "**保留格式**"
+        );
+        assert!(resolve_sidecar_merge_markdown(
+            "",
+            "",
+            r#"{"type":"doc","content":[{"type":"image","attrs":{"src":"image.png"}}]}"#
+        )
+        .is_err());
     }
 }
